@@ -1,0 +1,5 @@
+pdfplumber
+sentence-transformers
+chromadb
+anthropic
+numpy
