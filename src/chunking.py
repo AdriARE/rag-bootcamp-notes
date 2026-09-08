@@ -20,10 +20,60 @@ from pathlib import Path
 # información y rompen el anclaje de línea del regex de headers.
 PUA_PATTERN = re.compile(r'[\uE000-\uF8FF]')
 
-
 def clean_text(texto: str) -> str:
-    """Elimina caracteres de icono (Private Use Area) que no son texto real."""
-    return PUA_PATTERN.sub('', texto)
+    """
+    Limpia el texto crudo antes de detectar headers y generar chunks:
+    - Caracteres de icono (Private Use Area) que rompen el anclaje de línea.
+    - Fórmulas LaTeX duplicadas (artefacto de exportación de MathJax).
+    - Líneas largas repetidas (logs de librerías verbosas como LightGBM).
+    """
+    texto = PUA_PATTERN.sub('', texto)
+    texto = clean_duplicated_latex(texto)
+    texto = clean_repeated_lines(texto)
+    return texto
+
+
+# Artefacto de exportación de MathJax desde Colab: tanto fórmulas en bloque
+# ($$...$$) como inline ($...$) aparecen duplicadas, pegadas inmediatamente
+# a sí mismas sin nada entre medias. Ej: "$$ y=x $$$$ y=x $$" o "$y$$y$".
+LATEX_DUP_PATTERN = re.compile(r'(\${1,2})([^$]+?)\1\1\2\1')
+
+
+def clean_duplicated_latex(texto: str) -> str:
+    """Colapsa fórmulas LaTeX (bloque o inline) duplicadas inmediatamente."""
+    return LATEX_DUP_PATTERN.sub(r'\1\2\1', texto)
+
+MIN_LINEA_REPETIDA = 30
+
+
+def clean_repeated_lines(texto: str) -> str:
+    """
+    Colapsa líneas largas que se repiten 3+ veces dentro del mismo texto,
+    conservando solo la primera aparición. Pensado para logs verbosos de
+    entrenamiento (ej. warnings de LightGBM repetidos docenas de veces)
+    que no aportan información nueva al embedding.
+
+    Solo actúa sobre líneas de MIN_LINEA_REPETIDA+ caracteres, para no
+    tocar líneas de código cortas que se repiten legítimamente (ej.
+    "print(x)"), que no son ruido.
+    """
+    lineas = texto.split('\n')
+    conteos = {}
+    for linea in lineas:
+        clave = linea.strip()
+        if len(clave) >= MIN_LINEA_REPETIDA:
+            conteos[clave] = conteos.get(clave, 0) + 1
+
+    vistas = set()
+    resultado = []
+    for linea in lineas:
+        clave = linea.strip()
+        if len(clave) >= MIN_LINEA_REPETIDA and conteos[clave] >= 3:
+            if clave in vistas:
+                continue
+            vistas.add(clave)
+        resultado.append(linea)
+    return '\n'.join(resultado)    
 
 
 # --- Detección de candidatos a header ----------------------------------
@@ -47,19 +97,29 @@ TITLE_ALLOWED = re.compile(
 DECIMAL_NUMBER_PATTERN = re.compile(r'\d+\.\d+')
 
 
+MAX_TITLE_WORDS = 8
+
 def _is_natural_language(titulo: str) -> bool:
     """
     Un título real de sección es prosa: solo letras, dígitos sueltos,
-    espacios y puntuación básica - y como mucho un número con decimales.
-    Código u output de Python trae símbolos que no aparecen en prosa
-    española (=, _, [, ], #...); filas de tabla traen varios decimales
-    seguidos.
+    espacios y puntuación básica - y como mucho un número con decimales,
+    y a lo sumo un token puramente numérico. Filas de tabla impresas
+    (DataFrames) traen varios números enteros o decimales seguidos, sea
+    cual sea el formato (ej. "MAY 363 420 472" o "98.21 9.91 0.90") - dos
+    o más tokens numéricos sueltos es señal fiable de tabla, no de título.
+    Además, un título real es corto (nombra un tema); una definición o
+    explicación enumerada es una oración completa, mucho más larga.
     """
     if not TITLE_ALLOWED.match(titulo):
         return False
     if not any(c.isalpha() for c in titulo):
         return False
     if len(DECIMAL_NUMBER_PATTERN.findall(titulo)) >= 2:
+        return False
+    tokens_numericos = sum(1 for tok in titulo.split() if tok.replace('.', '', 1).isdigit())
+    if tokens_numericos >= 2:
+        return False
+    if len(titulo.split()) > MAX_TITLE_WORDS:
         return False
     return True
 
@@ -117,6 +177,7 @@ def classify_headers(
     n = len(candidatos)
     es_indice = [False] * n
 
+
     marker = CONTENIDO_MARKER.search(texto)
     if marker:
         start_idx = next(
@@ -125,31 +186,46 @@ def classify_headers(
         )
         if start_idx is not None:
             j = start_idx
-            while j + 1 < n and (candidatos[j + 1].start - candidatos[j].end) < gap_threshold:
+            anterior = _numero_tuple(candidatos[start_idx].numero)
+            while j + 1 < n:
+                gap_corto = (candidatos[j + 1].start - candidatos[j].end) < gap_threshold
+                siguiente = _numero_tuple(candidatos[j + 1].numero)
+                avanza = siguiente > anterior
+                if not gap_corto or not avanza:
+                    break
+                anterior = siguiente
                 j += 1
             for k in range(start_idx, j + 1):
                 es_indice[k] = True
 
-    i = 0
-    while i < n:
-        if es_indice[i]:
-            i += 1
-            continue
-        j = i
-        anterior = _numero_tuple(candidatos[i].numero)
-        while j + 1 < n and not es_indice[j + 1]:
-            gap_corto = (candidatos[j + 1].start - candidatos[j].end) < gap_threshold
-            siguiente = _numero_tuple(candidatos[j + 1].numero)
-            avanza = siguiente > anterior
-            if not gap_corto or not avanza:
-                break
-            anterior = siguiente
-            j += 1
-        streak_len = j - i + 1
-        if streak_len >= streak_min:
-            for k in range(i, j + 1):
-                es_indice[k] = True
-        i = j + 1
+    if marker is None:
+        # Sin "Contenido" localizable, recurrimos a la heurística de huecos +
+        # monotonía como único criterio disponible. Con "Contenido" presente,
+        # confiamos solo en el bloque anclado: una lista de pasos en prosa
+        # (ej. "1. Definir la hipótesis... 4. Decisión...") puede simular un
+        # índice por huecos cortos y números crecientes, y arrastrar de forma
+        # incorrecta al header real que la sigue si dejamos que esta
+        # heurística clasifique también fuera del bloque anclado.
+        i = 0
+        while i < n:
+            if es_indice[i]:
+                i += 1
+                continue
+            j = i
+            anterior = _numero_tuple(candidatos[i].numero)
+            while j + 1 < n and not es_indice[j + 1]:
+                gap_corto = (candidatos[j + 1].start - candidatos[j].end) < gap_threshold
+                siguiente = _numero_tuple(candidatos[j + 1].numero)
+                avanza = siguiente > anterior
+                if not gap_corto or not avanza:
+                    break
+                anterior = siguiente
+                j += 1
+            streak_len = j - i + 1
+            if streak_len >= streak_min:
+                for k in range(i, j + 1):
+                    es_indice[k] = True
+            i = j + 1
 
     reales = [c for c, ind in zip(candidatos, es_indice) if not ind]
     indice = [c for c, ind in zip(candidatos, es_indice) if ind]
