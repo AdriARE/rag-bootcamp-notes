@@ -60,22 +60,24 @@ def build_chunk_id(chunk: dict) -> str:
     """
     Construye el identificador único de chunk que se usará como ID en ChromaDB.
 
-    numero_seccion NO alcanza como identificador único porque se repite entre
-    PDFs distintos (ej. la sección "2.1" existe en varias clases). La
-    combinación pdf_origen + numero_seccion tampoco alcanza si una sección
-    larga se dividió en varias partes por split_section() en chunking.py: en
-    ese caso varios chunks comparten pdf_origen y numero_seccion pero
-    difieren en `parte`. La combinación de los tres SÍ es única por
-    construcción del pipeline de chunking (una sección de un PDF dado genera
-    como mucho un chunk por valor de `parte`).
+    Se reutiliza directamente el campo "id" de corpus.json (ej. "chunk_0855"),
+    en vez de reconstruir un ID a partir de pdf_origen + numero_seccion + parte.
 
-    No se reutiliza directamente el campo "id" ya presente en corpus.json
-    porque no conocemos las garantías de unicidad con las que se generó en
-    la fase de export; reconstruir el ID a partir de campos cuya unicidad sí
-    podemos razonar es más seguro. El "id" original se conserva como
-    metadata (`id_original`) para trazabilidad.
+    Ese esquema de tres campos SE INTENTÓ primero, asumiendo que era único por
+    construcción del pipeline de chunking - pero resultó ser falso: dentro de
+    un mismo PDF, numero_seccion también se repite cuando distintos bloques
+    reinician su propia numeración interna. Ejemplo real (Clase 4, SQL): las
+    secciones "Bases de datos", "CREATE", "INSERT", "GRANT" y "START
+    TRANSACTION" tienen numero_seccion == "1" en el mismo documento, porque
+    cada bloque (DDL/DML/DCL/TCL) numera sus sentencias desde 1. Confirmado
+    con datos: 155 colisiones de ID al generar embeddings sobre el corpus real.
+
+    El campo "id" de corpus.json sí es fiable aquí porque se genera con un
+    contador secuencial global (id_counter) en build_corpus.py, único por
+    construcción sobre el corpus completo - no es un campo externo de origen
+    desconocido, es parte del mismo pipeline.
     """
-    return f"{chunk['pdf_origen']}::{chunk['numero_seccion']}::{chunk['parte']}"
+    return chunk["id"]
 
 
 def validate_unique_ids(chunk_ids: list[str]) -> None:
