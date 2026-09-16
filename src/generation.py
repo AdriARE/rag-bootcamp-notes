@@ -15,29 +15,23 @@ from prompts_draft import RAG_SYSTEM_PROMPT_DRAFT, build_user_message_draft
 from search import TOP_K_PROVISIONAL, semantic_search
 
 
-def generate_answer(
+def generate_answer_from_chunks(
     query: str,
-    top_k: int = TOP_K_PROVISIONAL,
+    chunks: list[dict],
     client: anthropic.Anthropic = None,
 ) -> dict:
     """
-    Pipeline completo de una consulta: retrieval (search.py) + generación
-    (Claude), usando el prompt DRAFT de prompts_draft.py.
-
-    top_k se reexpone aquí con el mismo default provisional de search.py
-    (importado, no redefinido, para que no puedan quedar desincronizados)
-    porque quien genera una respuesta necesita poder controlar cuánto
-    contexto se recupera, igual que quien solo busca.
-
-    Devuelve un dict con la respuesta y los chunks usados como contexto
-    (para poder mostrar las fuentes en la interfaz más adelante, o
-    depurar por qué una respuesta salió mal), en vez de solo el string de
-    respuesta.
+    Llama a Claude con chunks YA recuperados (usa el prompt DRAFT de
+    prompts_draft.py). Separada de generate_answer() para que quien ya hizo
+    el retrieval (ej. para mostrar las fuentes en una interfaz antes de
+    esperar la respuesta generada) no tenga que repetirlo: cada llamada a
+    semantic_search recarga el modelo de embeddings si no se le pasa uno
+    cacheado, así que evitar una segunda búsqueda redundante no es solo
+    prolijidad, ahorra una re-embebida de la consulta.
     """
     if client is None:
         client = anthropic.Anthropic()
 
-    chunks = semantic_search(query, top_k=top_k)
     mensaje_usuario = build_user_message_draft(query, chunks)
 
     respuesta = client.messages.create(
@@ -51,6 +45,31 @@ def generate_answer(
         "respuesta": respuesta.content[0].text,
         "chunks_usados": chunks,
     }
+
+
+def generate_answer(
+    query: str,
+    top_k: int = TOP_K_PROVISIONAL,
+    collection=None,
+    model=None,
+    client: anthropic.Anthropic = None,
+) -> dict:
+    """
+    Pipeline completo de una consulta: retrieval (search.py) + generación
+    (generate_answer_from_chunks).
+
+    top_k se reexpone aquí con el mismo default provisional de search.py
+    (importado, no redefinido, para que no puedan quedar desincronizados)
+    porque quien genera una respuesta necesita poder controlar cuánto
+    contexto se recupera, igual que quien solo busca.
+
+    `collection` y `model` se reenvían tal cual a semantic_search (ver ahí
+    el porqué de inyectarlos: evitar recargar el modelo de embeddings o
+    reabrir ChromaDB en cada llamada, clave para un uso interactivo como
+    la interfaz de Streamlit).
+    """
+    chunks = semantic_search(query, top_k=top_k, collection=collection, model=model)
+    return generate_answer_from_chunks(query, chunks, client=client)
 
 
 def main():
