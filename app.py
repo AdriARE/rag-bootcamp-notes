@@ -16,12 +16,12 @@ preparados para esto (aceptan `collection`/`model` inyectados en vez de
 resolverlos ellos mismos en cada llamada).
 """
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-import anthropic
 import streamlit as st
 
 from generation import generate_answer_from_chunks
@@ -61,6 +61,22 @@ if n_chunks == 0:
 else:
     st.caption(f"Colección indexada: {n_chunks} chunks.")
 
+# Se chequea la presencia de la key ANTES de intentar generar, en vez de
+# confiar solo en capturar el error de la llamada: el SDK de Anthropic no
+# falla al construir el cliente sin key (es "lazy"), y cuando sí falla al
+# armar el request lo hace con un TypeError genérico, no con una subclase
+# de anthropic.AnthropicError - un detalle fácil de pasar por alto que
+# se descubrió recién al probar la app sin key configurada.
+tiene_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+if not tiene_api_key:
+    st.info(
+        "No se detectó ANTHROPIC_API_KEY en el entorno: la búsqueda "
+        "semántica funciona igual, pero la generación de respuesta con "
+        "Claude va a fallar. Configurá la variable de entorno para "
+        "habilitarla.",
+        icon="ℹ️",
+    )
+
 # top_k configurable desde la UI, con TOP_K_PROVISIONAL (src/search.py) como
 # valor inicial. Se expone como control del usuario en vez de una constante
 # fija precisamente porque ese default es una heurística sin validar contra
@@ -95,11 +111,14 @@ if preguntar and query:
     with st.spinner("Generando respuesta con Claude..."):
         try:
             resultado = generate_answer_from_chunks(query, chunks)
-        except anthropic.AnthropicError as e:
-            # Cubre tanto la falta de ANTHROPIC_API_KEY (el cliente falla al
-            # armar el request, no al construirse) como errores de la API
-            # (rate limit, modelo inválido, etc.) - en ambos casos la app no
-            # debe romperse con un traceback, sino explicar qué pasó.
+        except Exception as e:
+            # Se captura Exception (no solo anthropic.AnthropicError) porque
+            # la falta de ANTHROPIC_API_KEY produce un TypeError genérico
+            # del SDK (falla al armar los headers del request, no es una
+            # subclase de AnthropicError) - se descubrió recién al probar
+            # la app sin key. La llamada a la API es un límite de sistema
+            # externo: cualquier falla ahí debe mostrarse como error de la
+            # interfaz, no tirar abajo la app con un traceback.
             st.error(f"No se pudo generar la respuesta con la API de Claude: {e}")
         else:
             st.subheader("Respuesta")

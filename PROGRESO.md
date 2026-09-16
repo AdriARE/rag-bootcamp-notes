@@ -2,8 +2,8 @@
 
 ## Qué se hizo
 
-Se implementó el pipeline completo pedido, en 5 módulos nuevos dentro de `src/`,
-pensado para correrse por CLI (sin interfaz todavía):
+Se implementó el pipeline completo pedido, en 5 módulos nuevos dentro de `src/`
+más una interfaz Streamlit (`app.py`) que los une:
 
 1. **`src/config.py`** — constantes compartidas (rutas, nombre del modelo de
    embeddings, nombre de la colección de Chroma, modelo de Claude). Un único
@@ -37,21 +37,44 @@ pensado para correrse por CLI (sin interfaz todavía):
 5. **`src/prompts_draft.py` + `src/generation.py`** (Fase 7 - generación)
    - Prompt en un archivo separado y nombrado `prompts_draft.py`, con la
      constante `RAG_SYSTEM_PROMPT_DRAFT` — marcado como DRAFT a propósito.
-   - `generate_answer(query, top_k=...)` encadena retrieval + llamada a
-     Claude (`ANTHROPIC_MODEL_NAME` en `config.py`) y devuelve la respuesta
-     junto con los chunks usados (para poder mostrar fuentes más adelante).
+   - `generation.py` separa dos funciones: `generate_answer_from_chunks(query,
+     chunks)` (solo llama a Claude con chunks ya recuperados) y
+     `generate_answer(query, top_k=..., collection=None, model=None)`
+     (retrieval + generación). La separación existe para que quien ya hizo
+     el retrieval (típicamente para mostrar las fuentes antes de esperar la
+     respuesta) no tenga que repetirlo innecesariamente.
 
-Cada módulo tiene un bloque `if __name__ == "__main__":` para poder correrse
-como script suelto, ej.:
+6. **`app.py`** (interfaz Streamlit)
+   - Une todo el pipeline en una UI: pregunta → fragmentos recuperados
+     (en un expander, con distancia y metadata) → respuesta generada.
+   - El modelo de embeddings y el cliente de ChromaDB se cargan una sola
+     vez por proceso con `st.cache_resource`, no en cada pregunta (recargar
+     ~420MB de modelo por interacción haría la app inusable). Por eso
+     `search.py`/`generation.py` ya aceptaban `collection`/`model`
+     inyectados desde el principio.
+   - `top_k` es un slider en la barra lateral, con `TOP_K_PROVISIONAL`
+     (de `search.py`) como valor inicial — resuelve en la práctica el
+     "valor provisional pendiente de revisión": en vez de una sola
+     constante fija en el código, quien use la app lo puede ajustar sin
+     tocar nada.
+   - Si `ANTHROPIC_API_KEY` no está seteada, la app lo avisa de entrada
+     (en vez de esperar a que falle) y la búsqueda semántica sigue
+     funcionando igual — la generación es la única parte que depende de
+     la key.
+
+Cada módulo de `src/` además tiene un bloque `if __name__ == "__main__":`
+para poder correrse como script suelto, ej.:
 ```
 python src/embeddings.py
 python src/vector_store.py
 python src/search.py "¿qué es un embedding?"
 python src/generation.py "¿qué es un embedding?"
+streamlit run app.py
 ```
 
 `requirements.txt` se completó con: `sentence-transformers`, `chromadb`,
-`anthropic`, `numpy` (+ `pdfplumber`, ya usado por `extraction.py`).
+`anthropic`, `numpy`, `streamlit` (+ `pdfplumber`, ya usado por
+`extraction.py`).
 
 ## Decisiones de diseño (para poder explicarlas en la entrevista)
 
@@ -95,6 +118,24 @@ python src/generation.py "¿qué es un embedding?"
   Es la pieza más subjetiva de todo el pipeline (tono, formato de citación,
   qué tan estricto ser con "solo el contexto dado"). Lo dejé funcional pero
   claramente marcado para que lo revises antes de darlo por definitivo.
+- **`app.py` no genera embeddings ni indexa.** Solo lee una colección de
+  Chroma que ya existe. Indexar es una operación de varios minutos que
+  además solo hace falta rehacer cuando cambia el corpus o el modelo, no en
+  cada carga de página de una app web — mezclar eso en la UI sería lento y
+  confuso (¿qué pasa si dos personas abren la app a la vez mientras indexa?).
+- **`top_k` se resolvió como control de UI (slider), no como decisión
+  final de código.** Es la forma más directa de resolver "es provisional,
+  hay que poder ajustarlo": en vez de perseguir un valor "correcto" sin
+  tener el corpus real para medirlo, se le dio el control a quien usa la
+  app, con el valor heurístico como punto de partida visible.
+- **Se detectó (probando la app sin `ANTHROPIC_API_KEY`) que el SDK de
+  Anthropic no falla con una subclase de `anthropic.AnthropicError` cuando
+  falta la key, sino con un `TypeError` genérico al armar los headers del
+  request.** `app.py` primero chequea la variable de entorno de forma
+  explícita (mensaje claro, antes de intentar nada) y además captura
+  `Exception` en general alrededor de la llamada a la API (no solo
+  `AnthropicError`) para no depender de conocer cada tipo de excepción que
+  el SDK pueda lanzar en ese límite de sistema externo.
 
 ## Cómo se probó
 
@@ -105,7 +146,8 @@ como bloqueo de política, no un error transitorio). Por lo tanto **no se
 generaron embeddings reales de los 929 chunks en esta sesión**, y el corpus
 real nunca estuvo ni pasó por este entorno.
 
-Para no entregar código sin probar, sí se validó el pipeline completo con:
+Para no entregar código sin probar, sí se validó el pipeline completo (CLI
++ interfaz) con:
 - Un corpus sintético de 8 chunks (mismo esquema que el real, incluyendo a
   propósito `numero_seccion` repetido entre PDFs y una sección dividida en
   `parte`s) para probar la construcción de IDs y la detección de colisiones.
@@ -118,11 +160,24 @@ Para no entregar código sin probar, sí se validó el pipeline completo con:
   modelo real. **Esto no valida la calidad semántica de los resultados**
   (con vectores aleatorios el ranking no tiene significado), solo que el
   código no tiene bugs de plomería.
-- La llamada real a la API de Claude (`generation.py`) no se probó: no había
-  `ANTHROPIC_API_KEY` en esta sesión.
+- `app.py` se probó con `streamlit.testing.v1.AppTest` (la forma oficial de
+  testear apps Streamlit sin navegador, corriendo el script en el mismo
+  proceso), con el mismo doble de modelo y el mismo corpus sintético:
+  carga sin excepciones, detecta la colección indexada, el slider de
+  `top_k` está presente y funciona (probado con dos valores distintos,
+  confirmando que trae exactamente esa cantidad de fragmentos), el botón
+  "Preguntar" no rompe la app, y - sin `ANTHROPIC_API_KEY` en esta sesión -
+  el error de generación se muestra con `st.error()` en vez de tirar un
+  traceback (este último caso reveló y permitió corregir el bug descrito
+  arriba sobre el `TypeError` del SDK).
+- La llamada real a la API de Claude nunca devolvió una respuesta genuina:
+  no había `ANTHROPIC_API_KEY` en esta sesión, así que solo se validó el
+  camino de error (que sí es un resultado válido de la prueba, no un
+  sustituto de probarla con una key real).
 
 Ni el corpus sintético ni los artefactos generados quedaron en el repo
-(vive todo bajo `data/processed/`, gitignorado, y se limpió al terminar).
+(vive todo bajo `data/processed/`, gitignorado, y se limpió al terminar;
+tampoco el entorno virtual de prueba, `.venv/`).
 
 ## Pendiente de tu revisión
 
@@ -133,18 +188,23 @@ Ni el corpus sintético ni los artefactos generados quedaron en el repo
    python src/embeddings.py      # genera embeddings de los 929 chunks reales
    python src/vector_store.py    # indexa en ChromaDB local
    python src/search.py "una pregunta de prueba"
+   export ANTHROPIC_API_KEY=...
+   streamlit run app.py          # o: python src/generation.py "una pregunta"
    ```
    y confirmar que la búsqueda semántica trae resultados sensatos con datos
-   reales (esto no se pudo verificar aquí).
-2. **Revisar `TOP_K_PROVISIONAL` en `src/search.py`** (actualmente 5) —
-   ajustar si hace falta, idealmente con algún criterio empírico
-   (ej. mirar unos cuantos resultados con distintas preguntas reales del
-   material).
+   reales (esto no se pudo verificar aquí, solo con vectores aleatorios).
+2. **Revisar `TOP_K_PROVISIONAL` en `src/search.py`** (actualmente 5, y
+   valor inicial del slider en la app). Ya es ajustable sin tocar código
+   desde la UI, pero ese número de partida sigue sin validar contra el
+   corpus real — si al usar la app con preguntas reales notás que hace
+   falta otro valor por defecto, cambialo ahí.
 3. **Revisar el prompt en `src/prompts_draft.py`** (`RAG_SYSTEM_PROMPT_DRAFT`
    y `build_user_message_draft`) — tono, formato de citación de fuentes, y
    qué tan estricto debe ser con "solo el contexto dado". Una vez aprobado,
-   renombrar quitando "DRAFT" (y actualizar el import en `generation.py`).
-4. **Probar `generation.py` con una `ANTHROPIC_API_KEY` real** — no se pudo
-   probar la llamada efectiva a la API en esta sesión.
-5. Nada de extracción/chunking se tocó (según lo pedido); tampoco se
-   construyó la interfaz de Streamlit (`app.py` sigue vacío, a propósito).
+   renombrar quitando "DRAFT" (y actualizar los imports en `generation.py`
+   y `app.py` si corresponde).
+4. **Probar la generación con una `ANTHROPIC_API_KEY` real** — en esta
+   sesión solo se pudo validar que la app maneja bien la *ausencia* de key
+   (mensaje claro en vez de un traceback), no que una respuesta real de
+   Claude sea la esperada con el prompt actual.
+5. Nada de extracción/chunking se tocó (según lo pedido).
