@@ -3,3 +3,4 @@ sentence-transformers
 chromadb
 anthropic
 numpy
+streamlit
